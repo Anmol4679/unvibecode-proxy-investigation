@@ -1,109 +1,77 @@
-# UnvibeCode proxy-routing investigation
+# UnvibeCode Proxy Routing Reproduction
 
-## 1. Overview
+## Overview
 
-A small, local-only engineering reproduction of environment-proxy routing in UnvibeCode 0.4.0. It compares Python's standard urllib opener with the real installed `unvibecode.client.Client.request()` transport.
+This repository provides a minimal, local-only reproduction of proxy routing behavior in UnvibeCode 0.4.0 (`unvibecode.client.Client.request()`) compared to Python's standard `urllib.request`.
 
-**This is independent supporting evidence for an existing report, not a new bug discovery.** The upstream report is [FinanceFlash/unvibecode#692](https://github.com/FinanceFlash/unvibecode/issues/692). This project contains no fix and does not modify UnvibeCode.
+With `HTTPS_PROXY` or `HTTP_PROXY` configured in the environment, standard `urllib` routes requests through the proxy. UnvibeCode's client bypasses configured proxies, attempts direct socket connections, and raises an SSH-tunnel error if direct access is unavailable.
 
-## 2. Issue reproduced
+This repository provides independent supporting evidence for upstream issue [#692](https://github.com/FinanceFlash/unvibecode/issues/692). It does not claim to be a new bug discovery and contains no package modifications.
 
-The 0.4.0 client always supplies an empty proxy dictionary when constructing its opener. With a reachable forward proxy and a deliberately unavailable direct route, standard urllib succeeds through the proxy while UnvibeCode selects the direct route and reports an API/SSH-tunnel reachability error.
+Tested on Windows (`win32`) with CPython 3.14.7 and UnvibeCode 0.4.0.
 
-The main test uses `https://api.proxy-test.invalid/analysis`, a synthetic non-loopback hostname. No real API or repository upload is involved.
+## Reproduction
 
-## 3. Tested environment
+1. Set up a virtual environment and install the pinned package:
 
-| Component | Verified version |
-| --- | --- |
-| Operating system | Windows (`win32`) |
-| Python | CPython 3.14.7 |
-| UnvibeCode | 0.4.0 |
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-Other operating systems and Python versions have not been validated by this project. The script uses only the standard library and the pinned UnvibeCode package. Run without `-O`, since assertions verify expected observations.
+2. Run the reproduction script:
 
-## 4. Root cause
+```powershell
+.\.venv\Scripts\python.exe -B -X utf8 proxy_request_repro.py
+```
 
-In the inspected 0.4.0 installation, `unvibecode/client.py:23` contains:
+The script runs four controlled cases against an ephemeral loopback server and exits with code 0 if all assertions pass:
+
+```text
+unvibecode=0.4.0; python=3.14.7; platform=win32
+HTTPS_PROXY remote | urllib | OK | proxy_hits=1 | direct_attempts=0
+HTTPS_PROXY remote | Client.request | RuntimeError: Cannot reach API. Check the service and SSH tunnel. | proxy_hits=0 | direct_attempts=1
+HTTP_PROXY local HTTP | urllib | OK | proxy_hits=1 | direct_attempts=0
+HTTP_PROXY local HTTP | Client.request | RuntimeError: Cannot reach API. Check the service and SSH tunnel. | proxy_hits=0 | direct_attempts=1
+HTTPS NO_PROXY control | urllib | URLError: <urlopen error Synthetic direct route disabled; no DNS/TCP attempted> | proxy_hits=0 | direct_attempts=1
+HTTPS NO_PROXY control | Client.request | RuntimeError: Cannot reach API. Check the service and SSH tunnel. | proxy_hits=0 | direct_attempts=1
+HTTP NO_PROXY local control | urllib | OK | proxy_hits=0 | direct_attempts=1
+HTTP NO_PROXY local control | Client.request | OK | proxy_hits=0 | direct_attempts=1
+non-loopback HTTP URL: rejected as designed
+PASS: request-path assertions; loopback-only sockets; package unchanged
+```
+
+Pre-captured run logs are saved in `results/run-1.txt` and `results/run-2.txt`.
+
+## Expected vs Actual
+
+| Scenario | Standard `urllib` | `unvibecode.client.Client.request()` |
+| --- | --- | --- |
+| `HTTPS_PROXY` set, synthetic target, direct route disabled | Connects to proxy via `CONNECT`; succeeds | Bypasses proxy; attempts direct connection; fails with `RuntimeError` |
+| `HTTP_PROXY` set, localhost target, direct route disabled | Connects to proxy via absolute-form `GET`; succeeds | Bypasses proxy; attempts direct connection; fails with `RuntimeError` |
+| `NO_PROXY` set for target | Directly connects to target; fails as route disabled | Directly connects to target; fails with `RuntimeError` |
+| `NO_PROXY` set for reachable localhost target | Directly connects to target; succeeds | Directly connects to target; succeeds |
+
+The expected behavior for standard Python CLI tools is to honor `HTTP_PROXY` and `HTTPS_PROXY` for remote endpoints while allowing `NO_PROXY` to bypass local destinations.
+
+## Root Cause
+
+In `unvibecode/client.py`, line 23:
 
 ```python
 self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 ```
 
-An empty dictionary disables automatic proxy discovery. `Client.request()` uses that opener at line 32; submit/status/download/interim delegate to the same request path. Python documents this behavior in its [ProxyHandler reference](https://docs.python.org/3.14/library/urllib.request.html#urllib.request.ProxyHandler).
+Passing an empty dictionary `{}` to `urllib.request.ProxyHandler` disables automatic proxy discovery in Python's standard library. As documented in Python's [ProxyHandler documentation](https://docs.python.org/3/library/urllib.request.html#urllib.request.ProxyHandler), an empty dictionary causes `build_opener` to discard proxy handlers and ignore all environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`).
 
-The constructor permits HTTP only for loopback endpoints and mentions SSH tunneling (`client.py:21–22`). Keeping a localhost tunnel direct can be reasonable. It does not require disabling proxy discovery for public HTTPS endpoints. This distinction describes behavior, not a claim about the author's intent or an explicit documented proxy-support guarantee.
+While lines 21–22 permit HTTP for localhost to support local SSH tunneling, using `ProxyHandler({})` globally prevents proxy resolution for external HTTPS endpoints (`https://shipready-api.alphashots.ai/analysis`).
 
-## 5. Expected versus actual
+## Limitations
 
-| Controlled case | Standard urllib | Installed Client.request() |
-| --- | --- | --- |
-| HTTPS_PROXY; synthetic non-loopback HTTPS target; direct route refused | Proxy CONNECT and JSON response succeed | Direct route selected; RuntimeError |
-| HTTP_PROXY; localhost HTTP target; direct route refused | Absolute-form proxy request succeeds | Direct route selected; RuntimeError |
-| NO_PROXY matches synthetic HTTPS target | Direct route selected and refused | Direct route selected and refused |
-| NO_PROXY matches reachable localhost HTTP target | Direct request succeeds | Direct request succeeds |
+- **Local-only execution**: All requests are handled by an ephemeral loopback socket (`127.0.0.1`). Python audit hooks (`sys.addaudithook`) reject any non-loopback DNS or TCP connections.
+- **Mocked TLS**: The HTTPS test exercises Python's standard proxy `CONNECT` logic, but substitutes loopback plaintext inside the fixture rather than performing real TLS handshakes against a live proxy.
+- **Scope**: Authenticated proxies, SOCKS proxies, and Windows registry/PAC configurations were not tested.
 
-The practical interoperability expectation is to allow configured proxy routing for hosted HTTPS while preserving localhost bypass. Non-loopback HTTP is rejected as designed and is not presented as a bug.
+## Upstream Issue
 
-## 6. Reproduce
-
-Create an environment using the desired Python interpreter:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -B -X utf8 proxy_request_repro.py
-```
-
-Dependency installation needs package-index access or a suitable local wheel cache. **The reproduction itself is local-only.** No application repository, account, real API token or proxy credentials are required.
-
-Capture two runs in PowerShell:
-
-```powershell
-New-Item -ItemType Directory -Force results | Out-Null
-.\.venv\Scripts\python.exe -B -X utf8 proxy_request_repro.py | Tee-Object results/run-1.txt
-if ($LASTEXITCODE -ne 0) { throw 'Run 1 failed' }
-.\.venv\Scripts\python.exe -B -X utf8 proxy_request_repro.py | Tee-Object results/run-2.txt
-if ($LASTEXITCODE -ne 0) { throw 'Run 2 failed' }
-```
-
-## 7. Captured results
-
-Fresh captures from this project are in [results/run-1.txt](results/run-1.txt) and [results/run-2.txt](results/run-2.txt). Both runs completed all assertions with exit code 0 and produced identical output.
-
-Main comparison:
-
-```text
-HTTPS_PROXY remote | urllib | OK | proxy_hits=1 | direct_attempts=0
-HTTPS_PROXY remote | Client.request | RuntimeError: Cannot reach API. Check the service and SSH tunnel. | proxy_hits=0 | direct_attempts=1
-```
-
-Final assertion summary:
-
-```text
-PASS: request-path assertions; loopback-only sockets; package unchanged
-```
-
-`remote` labels the synthetic hostname; it does not indicate a contacted remote server. `direct_attempts` counts route selection intercepted before external DNS/TCP, not outgoing external packets. HTTPS proxy hits count CONNECT; HTTP proxy hits count absolute-form GET. A passing reproduction confirms the expected difference, not successful hosted connectivity.
-
-## 8. Developer impact
-
-When the permitted route to the hosted API requires a forward proxy and direct egress is unavailable, the client's direct-only opener cannot use that configured route. The resulting SSH-tunnel diagnostic can misdirect troubleshooting for hosted-service users. This is a transport concern independent of repository content.
-
-Actual enterprise connectivity and every client endpoint were not separately tested here. This reproduction does not establish a security vulnerability or explain any earlier TLS certificate error.
-
-## 9. Safety and limitations
-
-- Actual sockets connect only to an ephemeral server bound to `127.0.0.1`. Audit hooks reject non-loopback DNS and TCP.
-- A controlled `socket.create_connection` wrapper refuses synthetic direct routes before DNS or TCP. It does not bypass an actual firewall or organizational restriction.
-- The local HTTPS fixture performs real urllib CONNECT handling, but temporarily replaces TLS wrapping with the existing loopback socket. It then exchanges plaintext dummy HTTP within that fixture. **This is not a TLS/certificate test.** The context manager restores TLS wrapping afterward; no real service receives an unverified connection.
-- Environment proxy values and REQUEST_METHOD are controlled per case, preserving other Windows variables and restoring the original environment. Windows registry/PAC behavior, authenticated proxies and SOCKS are outside scope.
-- The package's request method, opener and ProxyHandler are not replaced. No installed package file is edited; the script verifies the client source hash before and after.
-- Only an explicit dummy bearer value and synthetic JSON are used. No source code, personal paths, private repository data or real credentials are included in the captured logs.
-- Audit hooks remain active until the Python process exits. Run this as a standalone script.
-
-## 10. Upstream reference and attribution
-
-[Upstream issue #692](https://github.com/FinanceFlash/unvibecode/issues/692) already reports environment proxies being disabled and the misleading SSH-tunnel error. This repository independently reproduces that existing mechanism with a controlled loopback fixture and additional bypass controls. It makes no original-discovery claim and does not reproduce every observation made in the upstream report.
-
-No issue, pull request, form submission or publication is performed by the script.
+This issue is tracked upstream in [FinanceFlash/unvibecode#692](https://github.com/FinanceFlash/unvibecode/issues/692). This reproduction provides an isolated, deterministic test case for regression verification.
